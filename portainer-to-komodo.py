@@ -181,9 +181,15 @@ def portainer_git_configs(portainer_data, stack_id):
         return []
     raw = db.read_bytes()
     decoder = json.JSONDecoder()
-    found = []
-    for match in re.finditer(rb'\{"Id":%d,' % stack_id, raw):
-        chunk = raw[match.start():match.start() + 200_000].decode("utf-8", "replace")
+    found, starts = [], set()
+    marker = b'"ProjectPath":"/data/compose/%d"' % stack_id
+    for match in re.finditer(re.escape(marker), raw):
+        # The stack record starts at the nearest {"Id": before its ProjectPath.
+        start = raw.rfind(b'{"Id":', max(0, match.start() - 200_000), match.start())
+        if start < 0 or start in starts:
+            continue
+        starts.add(start)
+        chunk = raw[start:start + 400_000].decode("utf-8", "replace")
         try:
             stack, _ = decoder.raw_decode(chunk)
         except ValueError:
@@ -191,11 +197,18 @@ def portainer_git_configs(portainer_data, stack_id):
         if not isinstance(stack, dict) or stack.get("ProjectPath") != f"/data/compose/{stack_id}":
             continue
         git = stack.get("GitConfig")
-        if not isinstance(git, dict) or not git.get("URL"):
+        deployed = stack.get("CurrentDeploymentInfo")
+        if isinstance(git, dict) and git.get("URL"):
+            # Portainer up to about 2.2x
+            auth = git.get("Authentication") if isinstance(git.get("Authentication"), dict) else {}
+            entry = {"url": git["URL"], "ref": git.get("ReferenceName") or "",
+                     "commit": git.get("ConfigHash") or "", "user": auth.get("Username") or ""}
+        elif isinstance(deployed, dict) and deployed.get("RepositoryURL"):
+            # Newer Portainer (e.g. 2.45): GitConfig is null, the source is in CurrentDeploymentInfo
+            entry = {"url": deployed["RepositoryURL"], "ref": deployed.get("ReferenceName") or "",
+                     "commit": deployed.get("ConfigHash") or "", "user": ""}
+        else:
             continue
-        auth = git.get("Authentication") if isinstance(git.get("Authentication"), dict) else {}
-        entry = {"url": git["URL"], "ref": git.get("ReferenceName") or "",
-                 "commit": git.get("ConfigHash") or "", "user": auth.get("Username") or ""}
         same = next((item for item in found if all(item[k] == entry[k] for k in ("url", "ref", "user"))), None)
         if same is None:
             found.append(entry)
