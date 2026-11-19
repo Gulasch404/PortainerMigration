@@ -2,6 +2,8 @@
 
 Übernimmt Git-basierte Portainer-Stacks als **Git-Stacks** in [Komodo](https://komodo.com). Das Script läuft direkt auf dem Docker-LXC, auf dem Portainer läuft. Es liest Repo, Branch und Compose-Pfad aus Portainers Klon, gleicht die Compose-Konfiguration mit den laufenden Containern ab (Mounts, Env-Werte, Images) und legt den Stack in Komodo an. Komodo klont das Repo danach selbst und baut daraus. Deployt wird erst danach, von dir selbst in Komodo.
 
+Stacks ohne Git-Quelle, also aus Portainers Web-Editor oder per Upload, legt das Script nach Rückfrage als **UI-Defined-Stack** an. Komodo speichert die Compose-Datei dann selbst. Ohne Rückfrage geht das mit `--ui-defined`.
+
 Die Werte aus Portainers `stack.env` übernimmt Komodo als Environment des Stacks. Komodo schreibt sie beim Deploy wieder nach `stack.env`, `env_file: stack.env` funktioniert also weiter.
 
 ## Voraussetzungen

@@ -312,14 +312,23 @@ def stage_project(args, group, portainer_data):
             print(f"Git-Einstellungen aus Portainers Datenbank gelesen ({stored['ref'] or 'ohne Ref'}).")
     repo_root = repo_root or stack_root
     url, branch = args.repo or url, args.branch or branch
-    if not url:
-        url = ask("Repo-URL nicht gefunden. Repo-URL (wie in Portainer unter Stacks): ")
-    if not branch:
-        branch = ask("Branch (z. B. main): ").removeprefix("refs/heads/")
-    if not url or not re.fullmatch(r"[A-Za-z0-9_./-]+", branch or ""):
-        raise MigrationError("Repo-URL und Branch sind erforderlich.")
-    args.repo, args.branch = url, branch  # a retry must not ask again
-    provider, repo, https = parse_repo_url(url)
+    if not url and args.ui_defined is None:
+        print("Keine Git-Quelle gefunden. Vermutlich wurde der Stack in Portainers Web-Editor angelegt.")
+        args.ui_defined = confirm("In Komodo als UI-Defined-Stack anlegen (Komodo speichert die Compose-Datei)?")
+    git = None
+    if args.ui_defined and not url:
+        if len(relative_files) != 1:
+            raise MigrationError("UI-Defined-Stacks unterstützen nur eine Compose-Datei. Bitte als Git-Stack anlegen.")
+    else:
+        if not url:
+            url = ask("Repo-URL (wie in Portainer unter Stacks): ")
+        if not branch:
+            branch = ask("Branch (z. B. main): ").removeprefix("refs/heads/")
+        if not url or not re.fullmatch(r"[A-Za-z0-9_./-]+", branch or ""):
+            raise MigrationError("Repo-URL und Branch sind erforderlich.")
+        args.repo, args.branch = url, branch  # a retry must not ask again
+        provider, repo, https = parse_repo_url(url)
+        git = {"git_provider": provider, "git_https": https, "repo": repo, "branch": branch}
     run_dir = str(source.relative_to(repo_root))
     for file in [run_dir, *relative_files]:
         if not SAFE_PATH.fullmatch(file) or ".." in Path(file).parts:
@@ -356,14 +365,23 @@ def stage_project(args, group, portainer_data):
         if environment.strip():
             env_files.append("stack.env")
     if (target / ".env").is_file():
+        if not git:
+            raise MigrationError(f"{target / '.env'}: UI-Defined-Stacks kennen nur ein Environment. "
+                                 "Inhalt in stack.env der Prüfkopie übernehmen, .env löschen, erneut prüfen.")
         env_files.append(".env")
-    print(f"Repo: {provider}/{repo} (Branch {branch}" + (f", Portainer lief auf {commit[:12]})" if commit else ")"))
+    if git:
+        print(f"Repo: {git['git_provider']}/{git['repo']} (Branch {git['branch']}"
+              + (f", Portainer lief auf {commit[:12]})" if commit else ")"))
+    else:
+        print("Typ: UI-Defined-Stack (Compose-Inhalt wird in Komodo gespeichert)")
     print(f"Compose: {run_dir}/{', '.join(relative_files)}")
     print("Env: " + (", ".join(env_files) if env_files else "keine"))
     return {
         "stack_dir": stack_dir, "target": target, "run_dir": run_dir, "files": relative_files,
         "env_files": env_files, "environment": environment, "portainer_user": portainer_user,
-        "git": {"git_provider": provider, "git_https": https, "repo": repo, "branch": branch},
+        "git": git,
+        # Read from the check copy so corrections made there are what Komodo stores.
+        "file_contents": None if git else (target / relative_files[0]).read_text(),
     }
 
 
@@ -628,7 +646,9 @@ def image_registry(image):
 
 
 def select_accounts(args, info):
-    if args.git_account is None:
+    if not info["git"]:
+        args.git_account = ""
+    elif args.git_account is None:
         if info.get("portainer_user"):
             print(f"\nPortainer hat für dieses Repo den Git-Benutzer {info['portainer_user']} verwendet (privates Repo).")
         args.git_account = choose_account(args.api, "git", info["git"]["git_provider"], "Git-Account")
@@ -671,20 +691,25 @@ def register(args, info, agent_id):
     config = {
         "server_id": server_id,
         "project_name": args.project,
-        **info["git"],
-        "git_account": args.git_account or "",
         "registry_provider": args.registry_provider or "",
         "registry_account": args.registry_account or "",
-        "run_directory": info["run_dir"],
-        "file_paths": info["files"],
         # Komodo writes the environment to stack.env, like Portainer did; services using
         # "env_file: stack.env" keep working.
         "environment": info["environment"],
         "env_file_path": "stack.env",
-        "additional_env_files": [
-            {"path": file, "track": False} for file in info["env_files"] if file != "stack.env"
-        ],
     }
+    if info["git"]:
+        config.update({
+            **info["git"],
+            "git_account": args.git_account or "",
+            "run_directory": info["run_dir"],
+            "file_paths": info["files"],
+            "additional_env_files": [
+                {"path": file, "track": False} for file in info["env_files"] if file != "stack.env"
+            ],
+        })
+    else:
+        config["file_contents"] = info["file_contents"]
     for stack in api("read", "ListFullStacks", limit=0):
         existing = stack["config"]
         same_project = (
@@ -700,8 +725,13 @@ def register(args, info, agent_id):
             raise MigrationError(f"Stack {stack['name']} existiert bereits mit anderer Konfiguration.")
     result = api("write", "CreateStack", name=name, config=config)
     mark_registered(args.project, result["name"])
-    print(f"Registriert: {result['name']} als Git-Stack ({config['repo']}, Branch {config['branch']}).")
-    print("Services in Komodo prüfen, dann dort deployen. Für Auto-Deploy bei Push den Webhook des Stacks im Repo eintragen.")
+    if info["git"]:
+        print(f"Registriert: {result['name']} als Git-Stack ({config['repo']}, Branch {config['branch']}).")
+        print("Services in Komodo prüfen, dann dort deployen. "
+              "Für Auto-Deploy bei Push den Webhook des Stacks im Repo eintragen.")
+    else:
+        print(f"Registriert: {result['name']} als UI-Defined-Stack. Compose-Datei ab jetzt in Komodo bearbeiten.")
+        print("Services in Komodo prüfen, dann dort deployen.")
 
 
 def ask(prompt):
@@ -779,7 +809,7 @@ def migrate(args, portainer, portainer_project, data):
     while True:
         migrate_one(args, portainer_project, data)
         remaining = pending_projects(portainer_project)
-        args.project = args.name = args.repo = args.branch = None
+        args.project = args.name = args.repo = args.branch = args.ui_defined = None
         args.git_account = args.registry_provider = args.registry_account = None
         if remaining:
             print(f"\nNoch nicht übernommen: {', '.join(entry['Name'] for entry in remaining)}")
@@ -861,6 +891,8 @@ def main():
         part.add_argument("--repo", help="Repo-URL, falls sie nicht aus Portainers Klon lesbar ist")
         part.add_argument("--branch", help="Branch, falls er nicht aus Portainers Klon lesbar ist")
         part.add_argument("--name", help="Stack-Name in Komodo, falls der Projektname schon belegt ist")
+        part.add_argument("--ui-defined", action="store_const", const=True, default=None,
+                          help="Stack ohne Git-Quelle als UI-Defined-Stack anlegen (sonst Nachfrage)")
         if command in ("migrate", "register"):
             part.add_argument("--git-account", help="Git-Account in Komodo für private Repos (sonst Auswahl)")
             part.add_argument("--registry-account", help="Registry-Account in Komodo für private Images (sonst Auswahl)")
@@ -872,7 +904,7 @@ def main():
         args.command = "migrate"
     defaults = {"project": None, "portainer": None, "env_file": None, "require_mount": [],
                 "name": None, "version": "2.3.4", "repo": None, "branch": None, "git_account": None,
-                "registry_account": None, "registry_provider": None}
+                "registry_account": None, "registry_provider": None, "ui_defined": None}
     for key, value in defaults.items():
         if not hasattr(args, key):
             setattr(args, key, value)
