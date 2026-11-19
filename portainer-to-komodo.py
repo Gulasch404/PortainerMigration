@@ -46,6 +46,7 @@ DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 PROJECT_LABEL = "com.docker.compose.project"
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 SAFE_PATH = re.compile(r"[A-Za-z0-9_./-]+\Z")
+ANONYMOUS_VOLUME = re.compile(r"[0-9a-f]{64}\Z")
 AGENT_YAML = """services:
   periphery:
     image: ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION}
@@ -251,8 +252,31 @@ def verify_model(model, group, target):
                 print(f"{name} {dest}: {expected}")
 
         for dest, mount in actual_mounts.items():
-            if dest not in checked and mount["Type"] in {"bind", "volume"}:
+            if dest in checked or mount["Type"] not in {"bind", "volume"}:
+                continue
+            volume = mount.get("Name") or ""
+            if mount["Type"] == "volume" and ANONYMOUS_VOLUME.fullmatch(volume):
+                problems.append(
+                    f"{name} {dest}: unbenanntes Volume {volume[:12]} (vermutlich VOLUME im Image). "
+                    f"In Compose als externes Volume mit name: {volume} einbinden, sonst gehen die Daten verloren."
+                )
+            else:
                 problems.append(f"{name} {dest}: bisheriger Mount nicht eindeutig in Compose definiert.")
+
+        image = cfg.get("image")
+        if image and not cfg.get("build"):
+            current = item["Config"].get("Image")
+            if image != current:
+                problems.append(f"{name}: Image bisher {current}, neu {image}.")
+            else:
+                local = run([*DOCKER, "image", "ls", "-q", "--no-trunc", image]).split()
+                if item["Image"] not in local:
+                    problems.append(
+                        f"{name}: Tag {image} fehlt lokal oder zeigt auf ein anderes Image als der laufende Container. "
+                        "Ein Deploy würde das Image wechseln."
+                    )
+                elif not re.search(r"@sha256:[0-9a-f]{64}\Z", image):
+                    print(f"Hinweis {name}: {image} ist nicht per Digest fixiert. Pull beim Deploy kann aktualisieren.")
         live_env = dict(entry.split("=", 1) for entry in item["Config"].get("Env") or [] if "=" in entry)
         for key, value in (cfg.get("environment") or {}).items():
             if value is not None and live_env.get(key) != str(value):
@@ -320,7 +344,22 @@ def komodo(core, category, operation, data, credentials):
         with build_opener(NoRedirect).open(request, timeout=20) as response:
             return json.load(response)
     except HTTPError as error:
-        raise MigrationError(f"Komodo {operation}: HTTP {error.code}. API-Zugang und Berechtigungen prüfen.") from error
+        detail = ""
+        try:
+            body = error.read(2000).decode("utf-8", "replace")
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                body = parsed.get("error") or parsed.get("message") or body
+            body = " ".join(str(body).split())[:500]
+            detail = f" Antwort: {body}" if body else ""
+        except OSError:
+            pass
+        raise MigrationError(
+            f"Komodo {operation}: HTTP {error.code}.{detail} API-Zugang und Berechtigungen prüfen."
+        ) from error
     except URLError as error:
         raise MigrationError(f"Core nicht erreichbar bei {operation}. URL und TLS prüfen.") from error
 
