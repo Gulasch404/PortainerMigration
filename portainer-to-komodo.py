@@ -258,6 +258,22 @@ def is_staging_copy(stack_dir):
     return (stack_dir / STAGING_MARKER).is_file() or (stack_dir / ".portainer-import-check.log").is_file()
 
 
+def leftover_or_abort(stack_dir, group):
+    """An unmarked folder: offer to replace it only if it is clearly not a Komodo clone and holds no container data."""
+    in_use = any(mount.get("Source") and Path(mount["Source"]).resolve().is_relative_to(stack_dir.resolve())
+                 for item in group for mount in item["Mounts"])
+    if stack_dir.is_symlink() or (stack_dir / ".git").exists() or in_use:
+        raise MigrationError(f"{stack_dir} existiert bereits (Komodo-Klon oder Containerdaten). "
+                             "Bitte prüfen, dann --name setzen.")
+    entries = sorted(path.name for path in stack_dir.iterdir())
+    print(f"{stack_dir} existiert bereits, ohne Git-Klon und ohne Containerdaten "
+          f"(vermutlich ein abgebrochener Lauf). Inhalt: {', '.join(entries[:15]) or 'leer'}"
+          + (" …" if len(entries) > 15 else ""))
+    if not confirm("Ordner löschen und neu anlegen?"):
+        raise MigrationError(f"{stack_dir} bleibt. Bitte prüfen, dann --name setzen.")
+    (stack_dir / STAGING_MARKER).write_text("Als Rest eines abgebrochenen Laufs bestätigt.\n")
+
+
 def remove_staging(stack_dir, group):
     if not stack_dir.exists():
         return
@@ -312,15 +328,18 @@ def stage_project(args, group, portainer_data):
     stack_dir = ROOT / "stacks" / (args.name or args.project)
     if stack_dir.exists() and not (stack_dir / STAGING_MARKER).is_file():
         if not is_staging_copy(stack_dir):
-            raise MigrationError(f"{stack_dir} existiert bereits (Komodo-Klon?). Bitte prüfen, dann --name setzen.")
-        remove_staging(stack_dir, group)  # copy from an older version of this script
+            leftover_or_abort(stack_dir, group)
+        remove_staging(stack_dir, group)  # copy from an older or interrupted run of this script
     target = stack_dir / run_dir
     if stack_dir.exists():
         print(f"Vorhandene Prüfkopie: {stack_dir}")
     else:
         # Komodo clones git stacks to <root>/stacks/<name>; checking there resolves relative paths as Komodo will.
-        shutil.copytree(repo_root, stack_dir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        # The marker goes first so an interrupted copy is still recognised as ours.
+        stack_dir.mkdir(parents=True)
         (stack_dir / STAGING_MARKER).write_text("Prüfkopie, wird vor der Registrierung gelöscht.\n")
+        shutil.copytree(repo_root, stack_dir, symlinks=True, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(".git"))
         if args.env_file:
             with (target / "stack.env").open("a") as handle:
                 handle.write("\n" + args.env_file.read_text())
