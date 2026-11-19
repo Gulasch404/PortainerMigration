@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Portainer-Compose-Projekte auf demselben Docker-LXC in Komodo übernehmen.
 
-Ablauf:
+Geführt in einem Schritt (mit Bestätigungen):
+  python3 portainer-to-komodo.py
+
+Einzeln:
   python3 portainer-to-komodo.py list
   python3 portainer-to-komodo.py stage slotpilot
   python3 portainer-to-komodo.py agent
   python3 portainer-to-komodo.py register slotpilot
+  python3 portainer-to-komodo.py remove-portainer
 
 Als root im Docker-LXC ausführen. Benötigt Python 3.9+ und Docker Compose v2.
 agent fragt nach einem Komodo Server Onboarding Key. register fragt nach einem
@@ -47,6 +51,7 @@ PROJECT_LABEL = "com.docker.compose.project"
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 SAFE_PATH = re.compile(r"[A-Za-z0-9_./-]+\Z")
 ANONYMOUS_VOLUME = re.compile(r"[0-9a-f]{64}\Z")
+REGISTERED_MARKER = ".portainer-import-registered"
 AGENT_YAML = """services:
   periphery:
     image: ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION}
@@ -406,29 +411,167 @@ def register(args, target, files, env_files, agent_id):
         )
         if stack["name"] == name or same_project:
             if all(existing.get(key) == value for key, value in config.items()):
+                (target / REGISTERED_MARKER).write_text(stack["name"] + "\n")
                 print(f"Bereits registriert: {stack['name']}")
                 return
             raise MigrationError(f"Stack {stack['name']} existiert bereits mit anderer Konfiguration.")
     result = api("write", "CreateStack", name=name, config=config)
+    (target / REGISTERED_MARKER).write_text(result["name"] + "\n")
     print(f"Registriert: {result['name']}. Services in Komodo prüfen, dann dort deployen.")
+
+
+def ask(prompt):
+    # Read from the terminal, not stdin: with "curl ... | python3 -" stdin is the script itself.
+    try:
+        with open("/dev/tty") as tty_in, open("/dev/tty", "w") as tty_out:
+            tty_out.write(prompt)
+            tty_out.flush()
+            answer = tty_in.readline()
+    except OSError as error:
+        raise MigrationError("Keine interaktive Konsole verfügbar. Einzelbefehle verwenden.") from error
+    if not answer:
+        raise EOFError("Eingabe beendet.")
+    return answer.strip()
+
+
+def confirm(prompt):
+    return ask(f"{prompt} [j/N] ").lower() in {"j", "ja", "y", "yes"}
+
+
+def portainer_projects(portainer_project):
+    projects = json.loads(run([*DOCKER, "compose", "ls", "--all", "--format", "json"]))
+    return [entry for entry in projects
+            if entry["Name"] != portainer_project and entry["ConfigFiles"].startswith("/data/compose/")]
+
+
+def prepare(args, portainer_project, data, agent_id=None):
+    if not PROJECT_RE.fullmatch(args.project or "") or args.project == portainer_project:
+        raise MigrationError("Bitte einen gültigen Anwendungs-Stack angeben.")
+    verify_required_mounts(args.require_mount)
+    group = containers(project=args.project)
+    if not group:
+        raise MigrationError(f"Keine Container für Projekt {args.project} gefunden.")
+    target, files, env_files = copy_project(args.project, group, data, args.env_file)
+    model = compose_model(args.project, target, files, env_files, agent_id)
+    verify_model(model, group, target)
+    return target, files, env_files
+
+
+def pending_projects(portainer_project):
+    """Portainer stacks that have not been registered in Komodo by this script yet."""
+    return [entry for entry in portainer_projects(portainer_project)
+            if not (ROOT / "stacks" / entry["Name"] / REGISTERED_MARKER).is_file()]
+
+
+def remove_portainer(portainer, data, portainer_project):
+    name = portainer["Name"].lstrip("/")
+    remaining = [entry["Name"] for entry in pending_projects(portainer_project)]
+    if remaining:
+        raise MigrationError(
+            "Noch nicht übernommen: " + ", ".join(remaining) + ". Ohne Portainer kann das Script "
+            "diese Stacks nicht mehr übernehmen. Zuerst migrieren, dann Portainer entfernen."
+        )
+    print(f"Der Container {name} wird gestoppt und entfernt. Die Stack-Container laufen weiter.")
+    print(f"Die Portainer-Daten unter {data} bleiben erhalten (Sicherung, enthält auch Env-Dateien mit Secrets).")
+    if ask(f"Zum Bestätigen den Containernamen eingeben ({name}): ") != name:
+        raise MigrationError("Nicht bestätigt. Portainer bleibt installiert.")
+    run([*DOCKER, "stop", portainer["Id"]])
+    run([*DOCKER, "rm", portainer["Id"]])
+    print(f"Portainer entfernt. Die Daten unter {data} kannst du später löschen, sobald alles in Komodo läuft.")
+
+
+def migrate(args, portainer, portainer_project, data):
+    while True:
+        migrate_one(args, portainer_project, data)
+        remaining = pending_projects(portainer_project)
+        args.project, args.name = None, None
+        if remaining:
+            print(f"\nNoch nicht übernommen: {', '.join(entry['Name'] for entry in remaining)}")
+            if not confirm("Weiteren Stack migrieren?"):
+                return
+            continue
+        print("\nAlle Portainer-Stacks sind übernommen.")
+        if confirm("Lokales Portainer jetzt entfernen (Container stoppen und löschen, Daten bleiben)?"):
+            remove_portainer(portainer, data, portainer_project)
+        return
+
+
+def migrate_one(args, portainer_project, data):
+    if not args.project:
+        entries = pending_projects(portainer_project) or portainer_projects(portainer_project)
+        if not entries:
+            raise MigrationError("Keine Portainer-Stacks auf diesem LXC gefunden.")
+        print("Portainer-Stacks auf diesem LXC:")
+        for number, entry in enumerate(entries, 1):
+            print(f"  {number}) {entry['Name']}\t{entry['Status']}")
+        choice = ask("Welcher Stack soll migriert werden? Nummer oder Name: ")
+        if choice.isdigit() and 1 <= int(choice) <= len(entries):
+            choice = entries[int(choice) - 1]["Name"]
+        args.project = choice
+
+    print(f"\n[1/3] {args.project}: Dateien kopieren und mit den laufenden Containern abgleichen")
+    while True:
+        try:
+            prepare(args, portainer_project, data)
+            break
+        except MigrationError as error:
+            print(f"\nProbleme gefunden:\n{error}\n", file=sys.stderr)
+            if not confirm("Dateien im Zielordner angepasst? Erneut prüfen?"):
+                raise MigrationError("Migration angehalten. Die Kopien bleiben erhalten, ein neuer Lauf setzt dort fort.")
+    print("Prüfung erfolgreich.")
+
+    print("\n[2/3] Komodo Periphery")
+    try:
+        agent_id = agent_container()
+        print(f"Periphery läuft bereits ({agent_id[:12]}).")
+    except MigrationError:
+        if not confirm(f"Periphery ist noch nicht aktiv. Jetzt als Server {args.server} mit {args.core} verbinden?"):
+            raise MigrationError("Vor dem Start von Periphery angehalten.")
+        start_agent(args)
+        if not confirm("Ist der Server in Komodo unter Servers verbunden?"):
+            raise MigrationError("Angehalten. Verbindung in Komodo prüfen und erneut starten.")
+        agent_id = agent_container()
+
+    name = args.name or args.project
+    print(f"\n[3/3] Stack {name} in Komodo anlegen")
+    if not confirm(f"Stack {name} jetzt in {args.core} registrieren?"):
+        raise MigrationError("Vor der Registrierung angehalten. Ein neuer Lauf setzt dort fort.")
+    target, files, env_files = prepare(args, portainer_project, data, agent_id)
+    register(args, target, files, env_files, agent_id)
+    print("\nFertig. In Komodo die Services prüfen und dann dort deployen.")
+    print("Den Stack danach nicht in Portainer löschen: Das würde die Container per compose down entfernen.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--core", default=CORE, help="HTTPS-URL des Komodo Core")
     parser.add_argument("--server", default=socket.gethostname().split(".")[0], help="Servername in Komodo")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command")
     commands.add_parser("list", help="Lokale Portainer-Projekte anzeigen").add_argument("--portainer")
     commands.add_parser("agent", help="Komodo Periphery starten").add_argument("--version", default="2.3.4")
-    for command in ("stage", "register"):
-        part = commands.add_parser(command)
-        part.add_argument("project", help="Bisheriger Docker-Compose-Projektname")
+    commands.add_parser("remove-portainer",
+                        help="Portainer-Container entfernen, wenn alle Stacks übernommen sind (Daten bleiben)"
+                        ).add_argument("--portainer")
+    for command in ("migrate", "stage", "register"):
+        helptext = "Geführte Migration mit Bestätigungen (Standard ohne Befehl)" if command == "migrate" else None
+        part = commands.add_parser(command, help=helptext)
+        part.add_argument("project", nargs="?" if command == "migrate" else None,
+                          help="Bisheriger Docker-Compose-Projektname")
         part.add_argument("--portainer", help="Name oder ID des lokalen Portainer-Containers")
         part.add_argument("--env-file", type=Path, help="Zusätzlicher lokaler Portainer-Env-Export")
         part.add_argument("--require-mount", action="append", type=Path, default=[])
-        if command == "register":
+        if command in ("migrate", "register"):
             part.add_argument("--name", help="Anzeigename des Stacks bei Namenskollision")
+        if command == "migrate":
+            part.add_argument("--version", default="2.3.4", help="Version von Komodo Periphery")
     args = parser.parse_args()
+    if args.command is None:
+        args.command = "migrate"
+    defaults = {"project": None, "portainer": None, "env_file": None, "require_mount": [],
+                "name": None, "version": "2.3.4"}
+    for key, value in defaults.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
     if os.geteuid() != 0:
         raise MigrationError("Bitte als root im Docker-LXC ausführen.")
     os.umask(0o077)
@@ -439,31 +582,27 @@ def main():
         raise MigrationError("Eine HTTPS-URL ohne Anmeldedaten oder Query angeben.")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.server):
         raise MigrationError("Ein Servername ohne Leer- oder Sonderzeichen ist erforderlich.")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+        raise MigrationError("Version als x.y.z angeben.")
     if args.command == "agent":
-        if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
-            raise MigrationError("Version als x.y.z angeben.")
         start_agent(args)
         return
 
     portainer, data = portainer_mount(args.portainer)
     portainer_project = (portainer["Config"].get("Labels") or {}).get(PROJECT_LABEL)
     if args.command == "list":
-        projects = json.loads(run([*DOCKER, "compose", "ls", "--all", "--format", "json"]))
-        for entry in projects:
-            if entry["Name"] != portainer_project and entry["ConfigFiles"].startswith("/data/compose/"):
-                print(f"{entry['Name']}\t{entry['Status']}\t{entry['ConfigFiles']}")
+        for entry in portainer_projects(portainer_project):
+            print(f"{entry['Name']}\t{entry['Status']}\t{entry['ConfigFiles']}")
+        return
+    if args.command == "migrate":
+        migrate(args, portainer, portainer_project, data)
+        return
+    if args.command == "remove-portainer":
+        remove_portainer(portainer, data, portainer_project)
         return
 
-    if not PROJECT_RE.fullmatch(args.project) or args.project == portainer_project:
-        raise MigrationError("Bitte einen gültigen Anwendungs-Stack angeben.")
-    verify_required_mounts(args.require_mount)
-    group = containers(project=args.project)
-    if not group:
-        raise MigrationError(f"Keine Container für Projekt {args.project} gefunden.")
-    target, files, env_files = copy_project(args.project, group, data, args.env_file)
     agent_id = agent_container() if args.command == "register" else None
-    model = compose_model(args.project, target, files, env_files, agent_id)
-    verify_model(model, group, target)
+    target, files, env_files = prepare(args, portainer_project, data, agent_id)
     if args.command == "register":
         register(args, target, files, env_files, agent_id)
     else:
