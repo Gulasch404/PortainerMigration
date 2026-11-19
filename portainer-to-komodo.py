@@ -18,16 +18,17 @@ Anlegen von Stacks. Danach in Komodo die Services prüfen und selbst deployen.
 Bei Portainer-GitOps zuerst automatische Updates für diesen Stack deaktivieren.
 Für private Images den Registry-Zugang vor dem ersten Deploy prüfen.
 
-stage kopiert die Compose-Dateien und vorhandene .env/stack.env. Weitere
-Repo-Dateien und Build-Kontexte bei Bedarf in den angezeigten Zielordner
-übernehmen. Bei einem abweichenden relativen Bind-Mount den Quellpfad in der
-Kopie auf den angezeigten bisherigen absoluten LXC-Pfad setzen und erneut prüfen.
-Fehlt die Env-Datei, kann ein lokaler Portainer-Export über --env-file verwendet
-werden. Die Dateien werden im Zielordner bearbeitet. Vorhandene Kopien bleiben
-bei einem weiteren Lauf erhalten. --require-mount prüft einen LXC-Mountpoint,
-z. B. stage slotpilot --require-mount /mnt/daten. Die gleiche Option vor der
-Registrierung erneut setzen. Ein späteres Deploy prüft vorab den Mountpoint
-erneut manuell, wenn die Anwendung von diesem Mount abhängt.
+Jeder Stack wird in Komodo als Git-Stack angelegt. Repo, Branch und Pfad der
+Compose-Datei liest das Script aus Portainers Klon (sonst --repo/--branch). Die
+Werte aus Portainers stack.env übernimmt Komodo als Environment des Stacks.
+Private Repos brauchen einen in Komodo hinterlegten Git-Account (--git-account).
+
+Zum Prüfen kopiert stage Portainers Klon nach /etc/komodo/stacks/<name>, also
+dorthin, wo Komodo später selbst klont. So werden relative Pfade wie beim Deploy
+aufgelöst. Diese Prüfkopie wird vor der Registrierung gelöscht. Korrekturen
+gehören ins Git-Repo; zum erneuten Prüfen dieselbe Änderung in der Prüfkopie
+nachziehen. --require-mount prüft einen LXC-Mountpoint, z. B.
+stage slotpilot --require-mount /mnt/daten; vor der Registrierung erneut setzen.
 """
 import argparse
 import getpass
@@ -35,6 +36,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -52,6 +54,8 @@ PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 SAFE_PATH = re.compile(r"[A-Za-z0-9_./-]+\Z")
 ANONYMOUS_VOLUME = re.compile(r"[0-9a-f]{64}\Z")
 REGISTERED_MARKER = ".portainer-import-registered"
+STAGING_MARKER = ".portainer-import-staging"
+STATE = ROOT / "portainer-import"
 AGENT_YAML = """services:
   periphery:
     image: ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION}
@@ -140,7 +144,70 @@ def project_paths(group):
     return sets.pop()
 
 
-def copy_project(project, group, portainer_data, extra_env):
+def read_git_info(repo_root):
+    """Remote URL, branch and commit of Portainer's clone, read without needing git installed."""
+    git = repo_root / ".git"
+    url, in_origin = None, False
+    for line in (git / "config").read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_origin = line.replace(" ", "").replace("'", '"') == '[remote"origin"]'
+        elif in_origin and "=" in line and line.split("=", 1)[0].strip() == "url":
+            url = line.split("=", 1)[1].strip()
+    head = (git / "HEAD").read_text().strip()
+    branch = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else None
+    commit = head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+    if branch:
+        ref = git / "refs" / "heads" / branch
+        if ref.is_file():
+            commit = ref.read_text().strip()
+        elif (git / "packed-refs").is_file():
+            for line in (git / "packed-refs").read_text().splitlines():
+                if line.endswith(f" refs/heads/{branch}"):
+                    commit = line.split()[0]
+    return url, branch, commit
+
+
+def parse_repo_url(url):
+    """Split a clone URL into Komodo's git_provider, repo and git_https. Credentials are dropped."""
+    if url.startswith(("https://", "http://")):
+        parts = urlsplit(url)
+        host = (parts.hostname or "") + (f":{parts.port}" if parts.port else "")
+        path, https = parts.path, parts.scheme == "https"
+    elif url.startswith("ssh://"):
+        # The SSH port says nothing about the HTTPS port Komodo will use, so it is dropped.
+        parts = urlsplit(url)
+        host, path, https = parts.hostname or "", parts.path, True
+    else:
+        match = re.fullmatch(r"(?:ssh://)?[^@/\s]+@([^:/\s]+)[:/](.+)", url)
+        if not match:
+            raise MigrationError("Repo-URL nicht erkannt. --repo https://host/owner/repo angeben.")
+        host, path, https = match.group(1), match.group(2), True
+    path = path.strip("/")
+    path = path.removesuffix(".git")
+    if not host or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", path):
+        raise MigrationError("Repo-URL nicht erkannt. --repo https://host/owner/repo angeben.")
+    return host, path, https
+
+
+def is_staging_copy(stack_dir):
+    return (stack_dir / STAGING_MARKER).is_file() or (stack_dir / ".portainer-import-check.log").is_file()
+
+
+def remove_staging(stack_dir, group):
+    if not stack_dir.exists():
+        return
+    if stack_dir.is_symlink() or not is_staging_copy(stack_dir):
+        raise MigrationError(f"{stack_dir} stammt nicht von diesem Script und wird nicht gelöscht.")
+    for item in group:
+        for mount in item["Mounts"]:
+            source = mount.get("Source")
+            if source and Path(source).resolve().is_relative_to(stack_dir.resolve()):
+                raise MigrationError(f"{stack_dir} enthält Daten eines laufenden Containers ({source}). Nicht gelöscht.")
+    shutil.rmtree(stack_dir)
+
+
+def stage_project(args, group, portainer_data):
     working, source_files = project_paths(group)
     try:
         relative_workdir = working.relative_to("/data/compose")
@@ -149,43 +216,63 @@ def copy_project(project, group, portainer_data, extra_env):
         raise MigrationError("Compose-Dateien liegen außerhalb des Portainer-Stack-Verzeichnisses.") from error
     if not relative_workdir.parts or ".." in relative_workdir.parts:
         raise MigrationError("Ungültiges Portainer-Stack-Verzeichnis.")
+    stack_root = portainer_data / "compose" / relative_workdir.parts[0]
     source = portainer_data / "compose" / relative_workdir
-    target = ROOT / "stacks" / project
-    target.mkdir(parents=True, exist_ok=True)
+    repo_root = next((path for path in [source, *source.parents]
+                      if path.is_relative_to(stack_root) and (path / ".git").is_dir()), None)
+    url, branch, commit = read_git_info(repo_root) if repo_root else (None, None, None)
+    repo_root = repo_root or stack_root
+    url, branch = args.repo or url, args.branch or branch
+    if not url or not branch:
+        raise MigrationError("Repo oder Branch nicht aus Portainers Klon lesbar. --repo URL und --branch angeben.")
+    provider, repo, https = parse_repo_url(url)
+    run_dir = str(source.relative_to(repo_root))
+    for file in [run_dir, *relative_files]:
+        if not SAFE_PATH.fullmatch(file) or ".." in Path(file).parts:
+            raise MigrationError(f"Pfad im Repo ungeeignet: {file}")
+
+    stack_dir = ROOT / "stacks" / (args.name or args.project)
+    if stack_dir.exists() and not (stack_dir / STAGING_MARKER).is_file():
+        if not is_staging_copy(stack_dir):
+            raise MigrationError(f"{stack_dir} existiert bereits (Komodo-Klon?). Bitte prüfen, dann --name setzen.")
+        remove_staging(stack_dir, group)  # copy from an older version of this script
+    target = stack_dir / run_dir
+    if stack_dir.exists():
+        print(f"Vorhandene Prüfkopie: {stack_dir}")
+    else:
+        # Komodo clones git stacks to <root>/stacks/<name>; checking there resolves relative paths as Komodo will.
+        shutil.copytree(repo_root, stack_dir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        (stack_dir / STAGING_MARKER).write_text("Prüfkopie, wird vor der Registrierung gelöscht.\n")
+        if args.env_file:
+            with (target / "stack.env").open("a") as handle:
+                handle.write("\n" + args.env_file.read_text())
+        print(f"Prüfkopie aus Portainers Klon: {stack_dir}")
     for file in relative_files:
-        original = source / file
-        if not SAFE_PATH.fullmatch(file) or ".." in Path(file).parts or not original.is_file():
-            raise MigrationError(f"Compose-Datei fehlt oder ist ungeeignet: {file}")
-        install_file(target / file, original.read_bytes())
+        if not (target / file).is_file():
+            raise MigrationError(f"Compose-Datei fehlt: {file}")
 
+    environment = ""
     env_files = []
-    for name in (".env", "stack.env"):
-        if (source / name).is_file():
-            install_file(target / name, (source / name).read_bytes())
-            env_files.append(name)
-    local_override = target / "portainer-import.env"
-    if extra_env:
-        data = extra_env.read_bytes()
-        if local_override.exists() and local_override.read_bytes() != data:
-            raise MigrationError(f"{local_override} existiert bereits. Bei Bedarf lokal anpassen.")
-        install_file(local_override, data)
-    if local_override.is_file():
-        env_files.append(local_override.name)
-
-    for name in env_files:
-        (target / name).chmod(0o600)
-    print(f"Ziel: {target}")
-    print("Env-Dateien: " + (", ".join(env_files) if env_files else "keine gefunden"))
-    return target, relative_files, env_files
+    if (target / "stack.env").is_file():
+        (target / "stack.env").chmod(0o600)
+        environment = (target / "stack.env").read_text()
+        if environment.strip():
+            env_files.append("stack.env")
+    if (target / ".env").is_file():
+        env_files.append(".env")
+    print(f"Repo: {provider}/{repo} (Branch {branch}" + (f", Portainer lief auf {commit[:12]})" if commit else ")"))
+    print(f"Compose: {run_dir}/{', '.join(relative_files)}")
+    print("Env: " + (", ".join(env_files) if env_files else "keine"))
+    return {
+        "stack_dir": stack_dir, "target": target, "run_dir": run_dir, "files": relative_files,
+        "env_files": env_files, "environment": environment,
+        "git": {"git_provider": provider, "git_https": https, "repo": repo, "branch": branch},
+    }
 
 
 def compose_model(project, target, files, env_files, agent_id=None):
+    # Same env file order as Komodo: its generated stack.env first, then additional files.
     options = ["-p", project]
-    # An explicit env file prevents Compose from reusing a stray .env in the working directory.
-    # Komodo's generated file has a distinct name so it cannot replace an imported file.
-    if not env_files:
-        env_files = ["portainer-import-empty.env"]
-        install_file(target / env_files[0], b"")
     for name in env_files:
         options += ["--env-file", name]
     for file in files:
@@ -193,7 +280,8 @@ def compose_model(project, target, files, env_files, agent_id=None):
     command = [*DOCKER, "compose"]
     if agent_id:
         command = [*DOCKER, "exec", "--workdir", str(target), agent_id, "docker", "compose"]
-    log = target / ".portainer-import-check.log"
+    STATE.mkdir(parents=True, exist_ok=True)
+    log = STATE / f"{project}-check.log"
     model = json.loads(run(
         [*command, *options, "--profile", "*", "config", "--format", "json"],
         cwd=target, diagnostics=log,
@@ -369,14 +457,105 @@ def komodo(core, category, operation, data, credentials):
         raise MigrationError(f"Core nicht erreichbar bei {operation}. URL und TLS prüfen.") from error
 
 
-def register(args, target, files, env_files, agent_id):
-    credentials = tuple(getpass.getpass(prompt).strip() for prompt in ("Komodo API Key: ", "Komodo API Secret: "))
-    if not all(credentials):
-        raise MigrationError("API-Key und API-Secret sind erforderlich.")
+def mark_registered(project, stack_name):
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / f"{project}.registered").write_text(stack_name + "\n")
 
-    def api(category, operation, **data):
-        return komodo(args.core, category, operation, data, credentials)
 
+class KomodoClient:
+    """Asks for the API key on first use and keeps it for the rest of the run."""
+
+    def __init__(self, core):
+        self.core, self.credentials = core, None
+
+    def __call__(self, category, operation, **data):
+        if self.credentials is None:
+            credentials = tuple(getpass.getpass(prompt).strip()
+                                for prompt in ("Komodo API Key: ", "Komodo API Secret: "))
+            if not all(credentials):
+                raise MigrationError("API-Key und API-Secret sind erforderlich.")
+            self.credentials = credentials
+        return komodo(self.core, category, operation, data, self.credentials)
+
+
+ACCOUNT_REQUESTS = {
+    "git": ("ListGitProviderAccounts", "ListGitProvidersFromConfig"),
+    "registry": ("ListDockerRegistryAccounts", "ListDockerRegistriesFromConfig"),
+}
+
+
+def known_accounts(api, kind, domain):
+    """Usernames Komodo knows for a domain, from its database and from Core/Periphery config."""
+    names = set()
+    for operation in ACCOUNT_REQUESTS[kind]:
+        try:
+            result = api("read", operation)
+        except MigrationError:
+            continue  # missing permission or unknown request in this Komodo version
+        for item in result if isinstance(result, list) else []:
+            if not isinstance(item, dict) or item.get("domain") != domain:
+                continue
+            if item.get("username"):
+                names.add(item["username"])
+            for account in item.get("accounts") or []:
+                if isinstance(account, dict) and account.get("username"):
+                    names.add(account["username"])
+    return sorted(names)
+
+
+def choose_account(api, kind, domain, label, accounts=None):
+    accounts = known_accounts(api, kind, domain) if accounts is None else accounts
+    print(f"\n{label} für {domain}:")
+    print("  0) keiner (öffentlich)")
+    for number, account in enumerate(accounts, 1):
+        print(f"  {number}) {account}")
+    if not accounts:
+        print("  (in Komodo keine Accounts für diese Domain gefunden)")
+    choice = ask("Nummer oder Account-Name [0]: ")
+    if choice in ("", "0"):
+        return ""
+    if choice.isdigit() and 1 <= int(choice) <= len(accounts):
+        return accounts[int(choice) - 1]
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+", choice):
+        raise MigrationError("Ungültiger Account-Name.")
+    if choice not in accounts:
+        print(f"Hinweis: {choice} ist in Komodo nicht bekannt. Vor dem Deploy in Komodo anlegen.")
+    return choice
+
+
+def image_registry(image):
+    first, slash, _ = image.partition("/")
+    if slash and ("." in first or ":" in first or first == "localhost"):
+        return first
+    return "docker.io"
+
+
+def select_accounts(args, info):
+    if args.git_account is None:
+        args.git_account = choose_account(args.api, "git", info["git"]["git_provider"], "Git-Account")
+    registries = info["registries"]
+    if args.registry_account is not None:
+        if args.registry_provider is None:
+            private = [domain for domain in registries if domain != "docker.io"]
+            if len(private) != 1:
+                raise MigrationError("Registry nicht eindeutig. --registry-provider DOMAIN angeben.")
+            args.registry_provider = private[0]
+        return
+    chosen = []
+    for domain in registries:
+        accounts = known_accounts(args.api, "registry", domain)
+        if domain == "docker.io" and not accounts:
+            continue  # Docker Hub without a stored account: public images, nothing to ask
+        account = choose_account(args.api, "registry", domain, "Registry-Login", accounts)
+        if account:
+            chosen.append((domain, account))
+    if len(chosen) > 1:
+        print(f"Hinweis: Ein Komodo-Stack kennt nur einen Registry-Login. Verwendet wird {chosen[0][0]}.")
+    args.registry_provider, args.registry_account = chosen[0] if chosen else ("", "")
+
+
+def register(args, info, agent_id):
+    api = args.api
     server = api("read", "GetServer", server=args.server)
     server_id = server.get("_id") or server.get("id")
     if isinstance(server_id, dict):
@@ -393,13 +572,18 @@ def register(args, target, files, env_files, agent_id):
     config = {
         "server_id": server_id,
         "project_name": args.project,
-        "files_on_host": True,
-        "run_directory": str(target),
-        "file_paths": files,
-        "env_file_path": ".komodo-generated.env",
+        **info["git"],
+        "git_account": args.git_account or "",
+        "registry_provider": args.registry_provider or "",
+        "registry_account": args.registry_account or "",
+        "run_directory": info["run_dir"],
+        "file_paths": info["files"],
+        # Komodo writes the environment to stack.env, like Portainer did; services using
+        # "env_file: stack.env" keep working.
+        "environment": info["environment"],
+        "env_file_path": "stack.env",
         "additional_env_files": [
-            {"path": file, "track": False}
-            for file in env_files or ["portainer-import-empty.env"]
+            {"path": file, "track": False} for file in info["env_files"] if file != "stack.env"
         ],
     }
     for stack in api("read", "ListFullStacks", limit=0):
@@ -411,13 +595,14 @@ def register(args, target, files, env_files, agent_id):
         )
         if stack["name"] == name or same_project:
             if all(existing.get(key) == value for key, value in config.items()):
-                (target / REGISTERED_MARKER).write_text(stack["name"] + "\n")
+                mark_registered(args.project, stack["name"])
                 print(f"Bereits registriert: {stack['name']}")
                 return
             raise MigrationError(f"Stack {stack['name']} existiert bereits mit anderer Konfiguration.")
     result = api("write", "CreateStack", name=name, config=config)
-    (target / REGISTERED_MARKER).write_text(result["name"] + "\n")
-    print(f"Registriert: {result['name']}. Services in Komodo prüfen, dann dort deployen.")
+    mark_registered(args.project, result["name"])
+    print(f"Registriert: {result['name']} als Git-Stack ({config['repo']}, Branch {config['branch']}).")
+    print("Services in Komodo prüfen, dann dort deployen. Für Auto-Deploy bei Push den Webhook des Stacks im Repo eintragen.")
 
 
 def ask(prompt):
@@ -451,16 +636,27 @@ def prepare(args, portainer_project, data, agent_id=None):
     group = containers(project=args.project)
     if not group:
         raise MigrationError(f"Keine Container für Projekt {args.project} gefunden.")
-    target, files, env_files = copy_project(args.project, group, data, args.env_file)
-    model = compose_model(args.project, target, files, env_files, agent_id)
-    verify_model(model, group, target)
-    return target, files, env_files
+    info = stage_project(args, group, data)
+    model = compose_model(args.project, info["target"], info["files"], info["env_files"], agent_id)
+    verify_model(model, group, info["stack_dir"])
+    info["registries"] = sorted({image_registry(cfg["image"])
+                                 for cfg in model["services"].values() if cfg.get("image")})
+    return info, group
+
+
+def finish_registration(args, portainer_project, data, agent_id):
+    """Check once more inside Periphery, remove the check copy so Komodo clones fresh, register."""
+    info, group = prepare(args, portainer_project, data, agent_id)
+    select_accounts(args, info)
+    remove_staging(info["stack_dir"], group)
+    register(args, info, agent_id)
 
 
 def pending_projects(portainer_project):
     """Portainer stacks that have not been registered in Komodo by this script yet."""
     return [entry for entry in portainer_projects(portainer_project)
-            if not (ROOT / "stacks" / entry["Name"] / REGISTERED_MARKER).is_file()]
+            if not (STATE / f"{entry['Name']}.registered").is_file()
+            and not (ROOT / "stacks" / entry["Name"] / REGISTERED_MARKER).is_file()]
 
 
 def remove_portainer(portainer, data, portainer_project):
@@ -484,7 +680,8 @@ def migrate(args, portainer, portainer_project, data):
     while True:
         migrate_one(args, portainer_project, data)
         remaining = pending_projects(portainer_project)
-        args.project, args.name = None, None
+        args.project = args.name = args.repo = args.branch = None
+        args.git_account = args.registry_provider = args.registry_account = None
         if remaining:
             print(f"\nNoch nicht übernommen: {', '.join(entry['Name'] for entry in remaining)}")
             if not confirm("Weiteren Stack migrieren?"):
@@ -509,15 +706,17 @@ def migrate_one(args, portainer_project, data):
             choice = entries[int(choice) - 1]["Name"]
         args.project = choice
 
-    print(f"\n[1/3] {args.project}: Dateien kopieren und mit den laufenden Containern abgleichen")
+    print(f"\n[1/3] {args.project}: Git-Stack ermitteln und mit den laufenden Containern abgleichen")
     while True:
         try:
             prepare(args, portainer_project, data)
             break
         except MigrationError as error:
             print(f"\nProbleme gefunden:\n{error}\n", file=sys.stderr)
-            if not confirm("Dateien im Zielordner angepasst? Erneut prüfen?"):
-                raise MigrationError("Migration angehalten. Die Kopien bleiben erhalten, ein neuer Lauf setzt dort fort.")
+            print("Korrekturen im Git-Repo pushen und zum Prüfen genauso in der Prüfkopie unter "
+                  f"{ROOT / 'stacks' / (args.name or args.project)} nachziehen.", file=sys.stderr)
+            if not confirm("Erneut prüfen?"):
+                raise MigrationError("Migration angehalten. Ein neuer Lauf setzt dort fort.")
     print("Prüfung erfolgreich.")
 
     print("\n[2/3] Komodo Periphery")
@@ -536,8 +735,7 @@ def migrate_one(args, portainer_project, data):
     print(f"\n[3/3] Stack {name} in Komodo anlegen")
     if not confirm(f"Stack {name} jetzt in {args.core} registrieren?"):
         raise MigrationError("Vor der Registrierung angehalten. Ein neuer Lauf setzt dort fort.")
-    target, files, env_files = prepare(args, portainer_project, data, agent_id)
-    register(args, target, files, env_files, agent_id)
+    finish_registration(args, portainer_project, data, agent_id)
     print("\nFertig. In Komodo die Services prüfen und dann dort deployen.")
     print("Den Stack danach nicht in Portainer löschen: Das würde die Container per compose down entfernen.")
 
@@ -560,18 +758,26 @@ def main():
         part.add_argument("--portainer", help="Name oder ID des lokalen Portainer-Containers")
         part.add_argument("--env-file", type=Path, help="Zusätzlicher lokaler Portainer-Env-Export")
         part.add_argument("--require-mount", action="append", type=Path, default=[])
+        part.add_argument("--repo", help="Repo-URL, falls sie nicht aus Portainers Klon lesbar ist")
+        part.add_argument("--branch", help="Branch, falls er nicht aus Portainers Klon lesbar ist")
+        part.add_argument("--name", help="Stack-Name in Komodo, falls der Projektname schon belegt ist")
         if command in ("migrate", "register"):
-            part.add_argument("--name", help="Anzeigename des Stacks bei Namenskollision")
+            part.add_argument("--git-account", help="Git-Account in Komodo für private Repos (sonst Auswahl)")
+            part.add_argument("--registry-account", help="Registry-Account in Komodo für private Images (sonst Auswahl)")
+            part.add_argument("--registry-provider", help="Registry-Domain zum Account, z. B. ghcr.io")
         if command == "migrate":
             part.add_argument("--version", default="2.3.4", help="Version von Komodo Periphery")
     args = parser.parse_args()
     if args.command is None:
         args.command = "migrate"
     defaults = {"project": None, "portainer": None, "env_file": None, "require_mount": [],
-                "name": None, "version": "2.3.4"}
+                "name": None, "version": "2.3.4", "repo": None, "branch": None, "git_account": None,
+                "registry_account": None, "registry_provider": None}
     for key, value in defaults.items():
         if not hasattr(args, key):
             setattr(args, key, value)
+    if args.git_account is not None:
+        args.git_account = args.git_account.strip()
     if os.geteuid() != 0:
         raise MigrationError("Bitte als root im Docker-LXC ausführen.")
     os.umask(0o077)
@@ -580,6 +786,7 @@ def main():
     if (url.scheme != "https" or not url.hostname or url.username or url.password
             or url.query or url.fragment or not re.fullmatch(r"https://[A-Za-z0-9.:[\]/_-]+", args.core)):
         raise MigrationError("Eine HTTPS-URL ohne Anmeldedaten oder Query angeben.")
+    args.api = KomodoClient(args.core)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.server):
         raise MigrationError("Ein Servername ohne Leer- oder Sonderzeichen ist erforderlich.")
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
@@ -601,11 +808,10 @@ def main():
         remove_portainer(portainer, data, portainer_project)
         return
 
-    agent_id = agent_container() if args.command == "register" else None
-    target, files, env_files = prepare(args, portainer_project, data, agent_id)
     if args.command == "register":
-        register(args, target, files, env_files, agent_id)
+        finish_registration(args, portainer_project, data, agent_container())
     else:
+        prepare(args, portainer_project, data)
         print("Compose, deklarierte Env-Werte und vorhandene Mounts geprüft.")
 
 
