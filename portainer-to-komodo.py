@@ -81,6 +81,10 @@ class MigrationError(Exception):
     pass
 
 
+class VerificationError(MigrationError):
+    """The compose model differs from the running containers; fixable in the repo."""
+
+
 def run(command, cwd=None, diagnostics=None):
     # Keep login-shell and COMPOSE_* values out of Compose interpolation.
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL") if key in os.environ}
@@ -168,6 +172,53 @@ def read_git_info(repo_root):
     return url, branch, commit
 
 
+def portainer_git_configs(portainer_data, stack_id):
+    """GitConfig of a stack from portainer.db (BoltDB). Values are plain JSON in the file,
+    so a byte scan finds them without a BoltDB library. Freed pages may hold older copies,
+    hence all distinct results are returned."""
+    db = portainer_data / "portainer.db"
+    if not db.is_file():
+        return []
+    raw = db.read_bytes()
+    decoder = json.JSONDecoder()
+    found = []
+    for match in re.finditer(rb'\{"Id":%d,' % stack_id, raw):
+        chunk = raw[match.start():match.start() + 200_000].decode("utf-8", "replace")
+        try:
+            stack, _ = decoder.raw_decode(chunk)
+        except ValueError:
+            continue
+        if not isinstance(stack, dict) or stack.get("ProjectPath") != f"/data/compose/{stack_id}":
+            continue
+        git = stack.get("GitConfig")
+        if not isinstance(git, dict) or not git.get("URL"):
+            continue
+        auth = git.get("Authentication") if isinstance(git.get("Authentication"), dict) else {}
+        entry = {"url": git["URL"], "ref": git.get("ReferenceName") or "",
+                 "commit": git.get("ConfigHash") or "", "user": auth.get("Username") or ""}
+        same = next((item for item in found if all(item[k] == entry[k] for k in ("url", "ref", "user"))), None)
+        if same is None:
+            found.append(entry)
+        elif same["commit"] != entry["commit"]:
+            same["commit"] = ""  # copies differ only in commit: unknown which one ran last
+    return found
+
+
+def git_from_portainer_db(portainer_data, stack_id):
+    candidates = portainer_git_configs(portainer_data, int(stack_id)) if stack_id.isdigit() else []
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        print("Portainers Datenbank enthält mehrere Stände für diesen Stack:")
+        for number, entry in enumerate(candidates, 1):
+            print(f"  {number}) {entry['url']} {entry['ref']} {entry['commit'][:12]}")
+        choice = ask("Welcher ist aktuell? Nummer: ")
+        if not (choice.isdigit() and 1 <= int(choice) <= len(candidates)):
+            raise MigrationError("Keine gültige Auswahl.")
+        return candidates[int(choice) - 1]
+    return candidates[0]
+
+
 def parse_repo_url(url):
     """Split a clone URL into Komodo's git_provider, repo and git_https. Credentials are dropped."""
     if url.startswith(("https://", "http://")):
@@ -221,10 +272,24 @@ def stage_project(args, group, portainer_data):
     repo_root = next((path for path in [source, *source.parents]
                       if path.is_relative_to(stack_root) and (path / ".git").is_dir()), None)
     url, branch, commit = read_git_info(repo_root) if repo_root else (None, None, None)
+    portainer_user = ""
+    if not url and not (args.repo and args.branch):
+        # Portainer keeps no .git in its copy; the git settings live in portainer.db.
+        stored = git_from_portainer_db(portainer_data, relative_workdir.parts[0])
+        if stored:
+            url, commit, portainer_user = stored["url"], stored["commit"], stored["user"]
+            if stored["ref"].startswith("refs/heads/"):
+                branch = stored["ref"].removeprefix("refs/heads/")
+            print(f"Git-Einstellungen aus Portainers Datenbank gelesen ({stored['ref'] or 'ohne Ref'}).")
     repo_root = repo_root or stack_root
     url, branch = args.repo or url, args.branch or branch
-    if not url or not branch:
-        raise MigrationError("Repo oder Branch nicht aus Portainers Klon lesbar. --repo URL und --branch angeben.")
+    if not url:
+        url = ask("Repo-URL nicht gefunden. Repo-URL (wie in Portainer unter Stacks): ")
+    if not branch:
+        branch = ask("Branch (z. B. main): ").removeprefix("refs/heads/")
+    if not url or not re.fullmatch(r"[A-Za-z0-9_./-]+", branch or ""):
+        raise MigrationError("Repo-URL und Branch sind erforderlich.")
+    args.repo, args.branch = url, branch  # a retry must not ask again
     provider, repo, https = parse_repo_url(url)
     run_dir = str(source.relative_to(repo_root))
     for file in [run_dir, *relative_files]:
@@ -265,7 +330,7 @@ def stage_project(args, group, portainer_data):
     print("Env: " + (", ".join(env_files) if env_files else "keine"))
     return {
         "stack_dir": stack_dir, "target": target, "run_dir": run_dir, "files": relative_files,
-        "env_files": env_files, "environment": environment,
+        "env_files": env_files, "environment": environment, "portainer_user": portainer_user,
         "git": {"git_provider": provider, "git_https": https, "repo": repo, "branch": branch},
     }
 
@@ -388,7 +453,7 @@ def verify_model(model, group, target):
                     or build.get("additional_contexts")):
                 problems.append(f"{name}: Build-Kontext oder Dockerfile lokal prüfen.")
     if problems:
-        raise MigrationError("\n".join(problems))
+        raise VerificationError("\n".join(problems))
 
 
 def agent_container():
@@ -532,6 +597,8 @@ def image_registry(image):
 
 def select_accounts(args, info):
     if args.git_account is None:
+        if info.get("portainer_user"):
+            print(f"\nPortainer hat für dieses Repo den Git-Benutzer {info['portainer_user']} verwendet (privates Repo).")
         args.git_account = choose_account(args.api, "git", info["git"]["git_provider"], "Git-Account")
     registries = info["registries"]
     if args.registry_account is not None:
@@ -713,8 +780,9 @@ def migrate_one(args, portainer_project, data):
             break
         except MigrationError as error:
             print(f"\nProbleme gefunden:\n{error}\n", file=sys.stderr)
-            print("Korrekturen im Git-Repo pushen und zum Prüfen genauso in der Prüfkopie unter "
-                  f"{ROOT / 'stacks' / (args.name or args.project)} nachziehen.", file=sys.stderr)
+            if isinstance(error, VerificationError):
+                print("Korrekturen im Git-Repo pushen und zum Prüfen genauso in der Prüfkopie unter "
+                      f"{ROOT / 'stacks' / (args.name or args.project)} nachziehen.", file=sys.stderr)
             if not confirm("Erneut prüfen?"):
                 raise MigrationError("Migration angehalten. Ein neuer Lauf setzt dort fort.")
     print("Prüfung erfolgreich.")
